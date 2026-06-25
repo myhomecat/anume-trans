@@ -4,23 +4,23 @@ import { useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 
 interface Props {
-  onFileSelect: (file: File) => void;
+  onFilesSelect: (files: File[]) => void;
 }
 
-export default function ImageUploader({ onFileSelect }: Props) {
+export default function ImageUploader({ onFilesSelect }: Props) {
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles.length > 0) {
-      onFileSelect(acceptedFiles[0]);
+      onFilesSelect(acceptedFiles);
     }
-  }, [onFileSelect]);
+  }, [onFilesSelect]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: {
       'image/*': ['.png', '.jpg', '.jpeg', '.webp']
     },
-    maxFiles: 1,
-    maxSize: 10 * 1024 * 1024, // 10MB
+    multiple: true,
+    maxSize: 10 * 1024 * 1024, // 10MB per file
   });
 
   return (
@@ -52,8 +52,8 @@ export default function ImageUploader({ onFileSelect }: Props) {
                 strokeLinejoin="round"
               />
             </svg>
-            <p className="mb-2">이미지를 드래그하거나 클릭하여 선택</p>
-            <p className="text-sm">PNG, JPG, WebP (최대 10MB)</p>
+            <p className="mb-2">이미지를 드래그하거나 클릭하여 선택 (여러 장 가능)</p>
+            <p className="text-sm">PNG, JPG, WebP (장당 최대 10MB)</p>
           </>
         )}
       </div>

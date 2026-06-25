@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     # Frontend URL (CORS용)
     FRONTEND_URL: str = "http://localhost:3000"
 
+    # CORS 허용 origin (쉼표 구분, .env로 오버라이드 — IP 하드코딩 금지)
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
+
     class Config:
         env_file = ".env"
 

@@ -46,3 +46,21 @@ export interface OCRResponse {
   text?: string;
   error?: string;
 }
+
+export interface BatchItemResult {
+  filename: string;
+  success: boolean;
+  output_url?: string;
+  texts?: TextItem[];
+  image_width?: number;
+  image_height?: number;
+  error?: string;
+}
+
+export interface BatchResponse {
+  success: boolean;
+  batch_id: string;
+  count: number;
+  results: BatchItemResult[];
+  zip_url?: string | null;
+}

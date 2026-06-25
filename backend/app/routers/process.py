@@ -2,6 +2,8 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 import os
 import uuid
+import zipfile
+from typing import List
 import aiofiles
 from PIL import Image, ImageDraw, ImageFont
 import textwrap
@@ -11,6 +13,7 @@ from ultralytics import YOLO
 from huggingface_hub import hf_hub_download
 
 from app.config import settings
+from app.device import DEVICE
 from app.models.schemas import ProcessResponse, TextItem, Region
 from app.services.translate_service import translate_service
 from app.services.ocr_service import OCRService
@@ -125,7 +128,7 @@ def detect_speech_bubbles(image_path: str, conf_threshold: float = 0.3) -> list:
     print(f"[DEBUG] Detecting speech bubbles with YOLOv8...")
 
     # YOLOv8로 감지
-    results = bubble_detector.predict(source=image_path, conf=conf_threshold, verbose=False)
+    results = bubble_detector.predict(source=image_path, conf=conf_threshold, device=DEVICE, verbose=False)
 
     bubbles = []
     for result in results:
@@ -747,6 +750,171 @@ async def process_image(
             job_id=job_id,
             error=str(e)
         )
+
+
+async def _run_pipeline(input_path, job_id, job_output_dir, file_ext, target_language):
+    """detection→OCR→번역(claude CLI)→inpaint→render 핵심 파이프라인. 배치에서 재사용."""
+    bubbles = detect_speech_bubbles(input_path)
+    print(f"[DEBUG] Found {len(bubbles)} speech bubbles")
+
+    img_pil = Image.open(input_path)
+    if img_pil.mode != 'RGB':
+        img_pil = img_pil.convert('RGB')
+
+    extracted_texts = []
+    for i, (x, y, w, h, contour) in enumerate(bubbles):
+        cropped = img_pil.crop((x, y, x + w, y + h))
+        text = ocr_service.extract_from_pil(cropped)
+        if text and text.strip():
+            extracted_texts.append({"original": text.strip(),
+                                    "region": {"x": x, "y": y, "w": w, "h": h},
+                                    "contour": contour})
+
+    texts = []
+    render_items = []
+    if extracted_texts:
+        originals = [item["original"] for item in extracted_texts]
+        translations = await translate_service.translate_batch(originals, target_language=target_language)
+        for i, item in enumerate(extracted_texts):
+            translated = translations[i] if i < len(translations) else item["original"]
+            region = item["region"]
+            texts.append(TextItem(original=item["original"], translated=translated,
+                                  location=f"({region['x']}, {region['y']})", type="dialogue",
+                                  region=Region(x=region["x"], y=region["y"], width=region["w"], height=region["h"])))
+            render_items.append({"translated": translated, "original": item["original"],
+                                 "region": region, "contour": item["contour"]})
+
+    img_width, img_height = img_pil.size
+    output_url = None
+    output_path = None
+    if render_items:
+        output_path = os.path.join(job_output_dir, "output.png")
+        await render_with_inpainting(input_path, render_items, output_path)
+        output_url = f"/outputs/{job_id}/output.png"
+
+    return {"texts": texts, "output_url": output_url, "output_path": output_path,
+            "image_width": img_width, "image_height": img_height}
+
+
+@router.post("/process/batch")
+async def process_batch(
+    images: List[UploadFile] = File(...),
+    target_language: str = Form(default="한국어"),
+    style: str = Form(default="manga"),
+):
+    """다중 이미지 처리 + ZIP 패키징 (2-phase).
+
+    Phase A: 전 이미지 감지+OCR로 텍스트만 수집
+    Phase B: 모든 텍스트를 1회 번역 (claude CLI 부팅 N→1로 단축)
+    Phase C: 이미지별 inpaint+render, ZIP 패키징
+    """
+    import time
+    batch_id = str(uuid.uuid4())
+    batch_output_dir = os.path.join(settings.OUTPUT_DIR, batch_id)
+    os.makedirs(batch_output_dir, exist_ok=True)
+
+    # ---- Phase A: 감지 + OCR (이미지별, MPS) ----
+    t0 = time.time()
+    collected = []  # 이미지별 컨텍스트
+    for idx, image in enumerate(images):
+        job_id = f"{batch_id}_{idx}"
+        job_upload_dir = os.path.join(settings.UPLOAD_DIR, job_id)
+        job_output_dir = os.path.join(settings.OUTPUT_DIR, job_id)
+        os.makedirs(job_upload_dir, exist_ok=True)
+        os.makedirs(job_output_dir, exist_ok=True)
+        orig_name = os.path.basename(image.filename or f"image_{idx}")
+        entry = {"job_id": job_id, "job_output_dir": job_output_dir,
+                 "orig_name": orig_name, "items": [], "w": 0, "h": 0, "error": None}
+        try:
+            file_ext = os.path.splitext(orig_name)[1] or ".png"
+            input_path = os.path.join(job_upload_dir, f"input{file_ext}")
+            async with aiofiles.open(input_path, 'wb') as fobj:
+                await fobj.write(await image.read())
+            entry["input_path"] = input_path
+
+            bubbles = detect_speech_bubbles(input_path)
+            img_pil = Image.open(input_path)
+            if img_pil.mode != 'RGB':
+                img_pil = img_pil.convert('RGB')
+            entry["w"], entry["h"] = img_pil.size
+            for (x, y, w, h, contour) in bubbles:
+                cropped = img_pil.crop((x, y, x + w, y + h))
+                text = ocr_service.extract_from_pil(cropped)
+                if text and text.strip():
+                    entry["items"].append({"original": text.strip(),
+                                           "region": {"x": x, "y": y, "w": w, "h": h},
+                                           "contour": contour})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            entry["error"] = str(e)
+        collected.append(entry)
+    print(f"[BATCH] Phase A (감지+OCR) {len(images)}장: {time.time()-t0:.2f}s")
+
+    # ---- Phase B: 전체 텍스트 1회 번역 ----
+    t1 = time.time()
+    flat = []
+    idxmap = []  # (collected_idx, item_idx)
+    for ci, c in enumerate(collected):
+        for ii, it in enumerate(c["items"]):
+            flat.append(it["original"])
+            idxmap.append((ci, ii))
+    if flat:
+        translations = await translate_service.translate_batch(flat, target_language=target_language)
+    else:
+        translations = []
+    for k, (ci, ii) in enumerate(idxmap):
+        collected[ci]["items"][ii]["translated"] = (
+            translations[k] if k < len(translations) else collected[ci]["items"][ii]["original"]
+        )
+    print(f"[BATCH] Phase B (번역 1회, 텍스트 {len(flat)}개): {time.time()-t1:.2f}s")
+
+    # ---- Phase C: 이미지별 inpaint + render + ZIP ----
+    t2 = time.time()
+    results = []
+    zip_members = []
+    for idx, c in enumerate(collected):
+        orig_name = c["orig_name"]
+        if c["error"]:
+            results.append({"filename": orig_name, "success": False, "error": c["error"]})
+            continue
+        try:
+            texts = []
+            render_items = []
+            for it in c["items"]:
+                region = it["region"]
+                translated = it.get("translated", it["original"])
+                texts.append(TextItem(original=it["original"], translated=translated,
+                                      location=f"({region['x']}, {region['y']})", type="dialogue",
+                                      region=Region(x=region["x"], y=region["y"],
+                                                    width=region["w"], height=region["h"])))
+                render_items.append({"translated": translated, "original": it["original"],
+                                     "region": region, "contour": it["contour"]})
+            output_url = None
+            if render_items:
+                output_path = os.path.join(c["job_output_dir"], "output.png")
+                await render_with_inpainting(c["input_path"], render_items, output_path)
+                output_url = f"/outputs/{c['job_id']}/output.png"
+                stem = os.path.splitext(orig_name)[0]
+                zip_members.append((f"{idx + 1:02d}_{stem}_translated.png", output_path))
+            results.append({"filename": orig_name, "success": True, "output_url": output_url,
+                            "texts": texts, "image_width": c["w"], "image_height": c["h"]})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            results.append({"filename": orig_name, "success": False, "error": str(e)})
+    print(f"[BATCH] Phase C (렌더+ZIP): {time.time()-t2:.2f}s")
+
+    zip_url = None
+    if zip_members:
+        zip_path = os.path.join(batch_output_dir, "result.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for arc, fp in zip_members:
+                zf.write(fp, arcname=arc)
+        zip_url = f"/outputs/{batch_id}/result.zip"
+
+    return {"success": True, "batch_id": batch_id, "count": len(images),
+            "results": results, "zip_url": zip_url}
 
 
 @router.get("/download/{job_id}/{filename}")
