@@ -860,7 +860,7 @@ async def process_batch(
             flat.append(it["original"])
             idxmap.append((ci, ii))
     if flat:
-        translations = await translate_service.translate_batch(flat, target_language=target_language)
+        translations = await translate_service.translate_batch_parallel(flat, target_language=target_language)
     else:
         translations = []
     for k, (ci, ii) in enumerate(idxmap):
