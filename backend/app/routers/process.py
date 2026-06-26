@@ -1070,13 +1070,13 @@ async def _run_batch_job(batch_id, entries, target_language):
         if sub:
             ok_n = sum(1 for r in results if r.get("success"))
             push_service.send_push(sub, "만화 번역 완료",
-                                    f"{ok_n}/{len(results)}장 번역 완료 — 클릭해 다운로드", url="/")
+                                    f"{ok_n}/{len(results)}장 번역 완료 — 클릭해 다운로드", url=f"/?job={batch_id}")
         if j.get("email_notify"):
             ok_n2 = sum(1 for r in results if r.get("success"))
             from app.config import settings as _st
             email_service.send_email(
                 "만화 번역 완료",
-                f"{ok_n2}/{len(results)}장 번역이 완료되었습니다.\n\n결과 확인/다운로드:\n{_st.PUBLIC_URL}\n",
+                f"{ok_n2}/{len(results)}장 번역이 완료되었습니다.\n\n결과 확인/다운로드:\n{_st.PUBLIC_URL}/?job={batch_id}\n",
             )
     except Exception as ex:
         import traceback; traceback.print_exc()
@@ -1156,7 +1156,7 @@ async def push_subscribe(payload: dict = Body(...)):
     if j and j.get("status") == "done":
         ok_n = sum(1 for r in j.get("results", []) if r.get("success"))
         push_service.send_push(sub, "만화 번역 완료",
-                               f"{ok_n}장 번역 완료 — 클릭해 다운로드", url="/")
+                               f"{ok_n}장 번역 완료 — 클릭해 다운로드", url=f"/?job={job_id}")
     return {"ok": True}
 
 

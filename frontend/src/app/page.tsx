@@ -74,9 +74,15 @@ export default function Home() {
   const [notifyEmail, setNotifyEmail] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // 마운트 시 localStorage에서 "내 작업" 복원
+  // 마운트 시 localStorage 복원 + ?job= 딥링크(메일/알림에서 온 경우) 병합
   useEffect(() => {
-    setSaved(loadSaved());
+    let initial = loadSaved();
+    const jobParam = new URLSearchParams(window.location.search).get('job');
+    if (jobParam && !initial.some((j) => j.job_id === jobParam)) {
+      initial = [{ job_id: jobParam, total: 0, label: '공유된 작업', created: Date.now() }, ...initial];
+      saveSaved(initial); // 이 기기 localStorage에도 등록 → 이후 추적
+    }
+    setSaved(initial);
   }, []);
 
   const refresh = useCallback(async (jobs: SavedJob[]) => {
