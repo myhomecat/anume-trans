@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import ImageUploader from '@/components/ImageUploader';
-import { submitBatchAsync, getJob, getOutputUrl } from '@/lib/api-client';
+import { submitBatchAsync, getJob, getOutputUrl, getVapidKey, subscribePush } from '@/lib/api-client';
 import { JobStatus } from '@/lib/types';
 
 interface Picked {
@@ -16,6 +16,34 @@ interface SavedJob {
   total: number;
   label: string;
   created: number;
+}
+
+function urlBase64ToUint8Array(base64String: string): Uint8Array {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
+async function ensurePushSubscription(): Promise<PushSubscription | null> {
+  if (typeof window === 'undefined') return null;
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return null;
+  const reg = await navigator.serviceWorker.register('/sw.js');
+  await navigator.serviceWorker.ready;
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') return null;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    const key = await getVapidKey();
+    if (!key) return null;
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(key),
+    });
+  }
+  return sub;
 }
 
 const LS_KEY = 'anume_jobs';
@@ -42,6 +70,7 @@ export default function Home() {
   const [saved, setSaved] = useState<SavedJob[]>([]);
   const [statuses, setStatuses] = useState<Record<string, JobStatus>>({});
   const [error, setError] = useState<string | null>(null);
+  const [notify, setNotify] = useState(true);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // 마운트 시 localStorage에서 "내 작업" 복원
@@ -113,6 +142,12 @@ export default function Home() {
       saveSaved(next);
       setSaved(next);
       setPicked([]); // 제출 후 선택 초기화 — 브라우저 닫아도 "내 작업"에서 추적됨
+      if (notify) {
+        try {
+          const sub = await ensurePushSubscription();
+          if (sub) await subscribePush(res.job_id, sub);
+        } catch { /* 알림 실패는 무시 (번역은 정상 진행) */ }
+      }
     } catch {
       setError('제출 실패. 분석기 서버 상태를 확인해주세요.');
     } finally {
@@ -160,6 +195,10 @@ export default function Home() {
             </div>
           )}
 
+          <label className="flex items-center gap-2 mt-4 text-sm text-gray-700 select-none cursor-pointer">
+            <input type="checkbox" checked={notify} onChange={(e) => setNotify(e.target.checked)} />
+            완료 시 브라우저 알림 받기 (탭 닫아도 옴)
+          </label>
           <button
             onClick={handleSubmit}
             disabled={picked.length === 0 || submitting}

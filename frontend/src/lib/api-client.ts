@@ -101,3 +101,17 @@ export async function getJob(jobId: string): Promise<JobStatus> {
   const response = await fetch(`${API_BASE_URL}/api/job/${jobId}`);
   return response.json();
 }
+
+export async function getVapidKey(): Promise<string> {
+  const r = await fetch(`${API_BASE_URL}/api/push/key`);
+  const d = await r.json();
+  return d.publicKey;
+}
+
+export async function subscribePush(jobId: string, subscription: PushSubscription): Promise<void> {
+  await fetch(`${API_BASE_URL}/api/push/subscribe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ job_id: jobId, subscription }),
+  });
+}

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Body
 from fastapi.responses import FileResponse
 import os
 import uuid
@@ -21,6 +21,7 @@ from app.services.translate_service import translate_service
 from app.services.ocr_service import OCRService
 from app.services.inpaint_service import inpaint_service
 from app.services.sam_service import get_sam_service
+from app.services import push_service
 
 router = APIRouter()
 
@@ -922,7 +923,8 @@ async def process_batch(
 
 
 # ===== 비동기 Job (브라우저 닫아도 백그라운드 처리) =====
-JOBS = {}  # job_id -> 상태 dict (메모리). status.json으로 디스크 영속(재시작 생존)
+JOBS = {}  # job_id -> 상태 dict
+PUSH_SUBS = {}  # job_id -> web push subscription (메모리). status.json으로 디스크 영속(재시작 생존)
 
 
 def _job_status_path(batch_id):
@@ -1023,6 +1025,12 @@ async def _run_batch_job(batch_id, entries, target_language):
 
         j["results"] = results; j["zip_url"] = zip_url; j["status"] = "done"
         _persist_job(batch_id)
+        # 완료 푸시 (구독돼 있으면)
+        sub = PUSH_SUBS.get(batch_id)
+        if sub:
+            ok_n = sum(1 for r in results if r.get("success"))
+            push_service.send_push(sub, "만화 번역 완료",
+                                    f"{ok_n}/{len(results)}장 번역 완료 — 클릭해 다운로드", url="/")
     except Exception as ex:
         import traceback; traceback.print_exc()
         j["status"] = "error"; j["error"] = str(ex); _persist_job(batch_id)
@@ -1075,6 +1083,30 @@ async def get_job(job_id: str):
             d = json.load(fp); d["job_id"] = job_id; return d
     from fastapi import HTTPException
     raise HTTPException(status_code=404, detail="job not found")
+
+
+@router.get("/push/key")
+async def push_key():
+    """브라우저 구독용 VAPID 공개키."""
+    return {"publicKey": push_service.public_key()}
+
+
+@router.post("/push/subscribe")
+async def push_subscribe(payload: dict = Body(...)):
+    """job_id에 대한 푸시 구독 저장. 이미 완료된 job이면 즉시 발송."""
+    job_id = payload.get("job_id")
+    sub = payload.get("subscription")
+    if not job_id or not sub:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="job_id, subscription 필요")
+    PUSH_SUBS[job_id] = sub
+    # 구독 도착 전에 이미 끝난 경우 즉시 발송
+    j = JOBS.get(job_id)
+    if j and j.get("status") == "done":
+        ok_n = sum(1 for r in j.get("results", []) if r.get("success"))
+        push_service.send_push(sub, "만화 번역 완료",
+                               f"{ok_n}장 번역 완료 — 클릭해 다운로드", url="/")
+    return {"ok": True}
 
 
 @router.get("/download/{job_id}/{filename}")

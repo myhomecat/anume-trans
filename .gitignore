@@ -36,3 +36,6 @@ npm-debug.log*
 # Virtual environments
 backend/venv*/
 venv*/
+
+# Web Push VAPID 비밀키
+backend/vapid_private.pem
