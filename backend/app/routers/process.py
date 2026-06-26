@@ -124,6 +124,44 @@ def estimate_original_font_size(text_mask: np.ndarray, region: dict, original_te
     return max(10, min(estimated_size, 40))
 
 
+_text_detector = None
+
+
+def _get_text_detector():
+    """말풍선 밖 텍스트(효과음·나레이션) 감지용 YOLO (ogkalu). 지연 로딩."""
+    global _text_detector
+    if _text_detector is None:
+        p = hf_hub_download(repo_id="ogkalu/comic-text-segmenter-yolov8m",
+                            filename="comic-text-segmenter.pt")
+        _text_detector = YOLO(p)
+        print("[DEBUG] Free-text detector loaded")
+    return _text_detector
+
+
+def detect_free_text(image_path: str, bubbles: list, conf_threshold: float = 0.3) -> list:
+    """말풍선과 겹치지 않는 텍스트 영역(효과음/나레이션) 감지. (x,y,w,h,None) 리스트."""
+    try:
+        det = _get_text_detector()
+        results = det.predict(source=image_path, conf=conf_threshold, device=DEVICE, verbose=False)
+    except Exception as e:
+        print(f"[DEBUG] free-text detect 실패: {e}")
+        return []
+    free = []
+    for result in results:
+        for box in result.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+            if w <= 0 or h <= 0:
+                continue
+            cx, cy = x + w / 2, y + h / 2
+            inside_bubble = any(bx <= cx <= bx + bw and by <= cy <= by + bh
+                                for (bx, by, bw, bh, _) in bubbles)
+            if not inside_bubble:
+                free.append((x, y, w, h, None))
+    print(f"[DEBUG] Free text (말풍선 밖): {len(free)}")
+    return free
+
+
 def detect_speech_bubbles(image_path: str, conf_threshold: float = 0.3) -> list:
     """
     YOLOv8로 말풍선 영역 감지 (딥러닝 기반)
@@ -994,11 +1032,12 @@ async def _run_batch_job(batch_id, entries, target_language):
         for i, e in enumerate(entries):
             try:
                 bubbles = detect_speech_bubbles(e["input_path"])
+                free = detect_free_text(e["input_path"], bubbles)
                 img_pil = Image.open(e["input_path"])
                 if img_pil.mode != 'RGB':
                     img_pil = img_pil.convert('RGB')
                 e["w"], e["h"] = img_pil.size
-                for (x, y, w, h, contour) in bubbles:
+                for (x, y, w, h, contour) in (bubbles + free):
                     cropped = img_pil.crop((x, y, x + w, y + h))
                     text = ocr_service.extract_from_pil(cropped)
                     if text and text.strip():
