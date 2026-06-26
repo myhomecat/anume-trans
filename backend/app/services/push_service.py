@@ -2,13 +2,14 @@
 import os
 import json
 from pywebpush import webpush, WebPushException
+from py_vapid import Vapid01
 
 _BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # backend/
 _PRIV = os.path.join(_BASE, "vapid_private.pem")
 _PUB = os.path.join(_BASE, "vapid_public.txt")
 VAPID_CLAIMS = {"sub": "mailto:pgchae@mediquitous.com"}
 
-_priv_cache = None
+_vapid = None
 
 
 def public_key() -> str:
@@ -19,12 +20,11 @@ def public_key() -> str:
         return ""
 
 
-def _private_pem() -> str:
-    global _priv_cache
-    if _priv_cache is None:
-        with open(_PRIV) as f:
-            _priv_cache = f.read()
-    return _priv_cache
+def _vapid_instance():
+    global _vapid
+    if _vapid is None:
+        _vapid = Vapid01.from_file(_PRIV)
+    return _vapid
 
 
 def send_push(subscription: dict, title: str, body: str, url: str = "/") -> bool:
@@ -32,7 +32,7 @@ def send_push(subscription: dict, title: str, body: str, url: str = "/") -> bool
         webpush(
             subscription_info=subscription,
             data=json.dumps({"title": title, "body": body, "url": url}),
-            vapid_private_key=_private_pem(),
+            vapid_private_key=_vapid_instance(),
             vapid_claims=dict(VAPID_CLAIMS),
         )
         return True
