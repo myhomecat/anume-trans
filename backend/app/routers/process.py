@@ -284,9 +284,8 @@ def render_horizontal_text(draw, text: str, x: int, y: int, w: int, h: int):
 
     text_len = len(text)
 
-    # 초기 폰트 크기 계산 (영역에 맞게)
-    font_size = int(min(h * 0.4, w / max(text_len, 1) * 1.8))
-    font_size = max(10, min(font_size, 20))
+    # 말풍선을 채우도록 큰 크기에서 시작해 맞을 때까지 축소 (상한 제거 → 큰 풍선엔 큰 글씨)
+    font_size = max(12, min(int(h * 0.9), 64))
     font = get_font(font_size)
 
     # 단어 단위 줄바꿈
@@ -314,7 +313,9 @@ def render_horizontal_text(draw, text: str, x: int, y: int, w: int, h: int):
     text_x = max(x, min(text_x, x + w - text_w))
     text_y = max(y, min(text_y, y + h - text_h))
 
-    draw.text((text_x, text_y), wrapped_text, font=font, fill=(0, 0, 0))
+    stroke = max(1, round(font_size / 14))
+    draw.text((text_x, text_y), wrapped_text, font=font, fill=(0, 0, 0),
+              stroke_width=stroke, stroke_fill=(255, 255, 255), align="center")
 
 
 def render_vertical_text(draw, text: str, x: int, y: int, w: int, h: int):
@@ -324,9 +325,9 @@ def render_vertical_text(draw, text: str, x: int, y: int, w: int, h: int):
 
     text_len = len(text)
 
-    # 폰트 크기 계산 (영역에 맞게) - 보수적으로 설정
-    font_size = int(min(w * 0.6, h / max(text_len, 1) * 0.9))
-    font_size = max(8, min(font_size, 16))
+    # 큰 크기에서 시작 (상한 완화 → 큰 풍선엔 큰 글씨)
+    font_size = int(min(w * 0.85, h / max(text_len, 1) * 1.0))
+    font_size = max(10, min(font_size, 48))
     font = get_font(font_size)
 
     # 한 열에 들어갈 글자 수 계산
@@ -372,7 +373,8 @@ def render_vertical_text(draw, text: str, x: int, y: int, w: int, h: int):
             # 글자가 영역을 벗어나면 중단
             if char_y + font_size > y + h:
                 break
-            draw.text((col_x, char_y), char, font=font, fill=(0, 0, 0))
+            draw.text((col_x, char_y), char, font=font, fill=(0, 0, 0),
+                      stroke_width=max(1, round(font_size / 14)), stroke_fill=(255, 255, 255))
             char_idx += 1
 
 
