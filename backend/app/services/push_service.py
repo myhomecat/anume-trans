@@ -35,6 +35,7 @@ def send_push(subscription: dict, title: str, body: str, url: str = "/") -> bool
             vapid_private_key=_vapid_instance(),
             vapid_claims=dict(VAPID_CLAIMS),
         )
+        print(f"[push] sent OK -> {str(subscription.get('endpoint',''))[:45]}...")
         return True
     except WebPushException as e:
         print(f"[push] send fail: {e}")
