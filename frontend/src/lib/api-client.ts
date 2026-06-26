@@ -1,4 +1,4 @@
-import { ProcessResponse, TranslateResponse, TranslateRequest, OCRResponse, TranslateStyle, BatchResponse } from './types';
+import { ProcessResponse, TranslateResponse, TranslateRequest, OCRResponse, TranslateStyle, BatchResponse, JobStatus } from './types';
 
 // same-origin: 브라우저는 자기 Next(BFF)만 호출, Next가 분석기로 중계
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || '';
@@ -77,5 +77,27 @@ export async function processBatch(
     body: formData,
   });
 
+  return response.json();
+}
+
+export async function submitBatchAsync(
+  files: File[],
+  targetLanguage: string = '한국어',
+  style: string = 'manga'
+): Promise<{ job_id: string; status: string; total: number }> {
+  const formData = new FormData();
+  files.forEach((f) => formData.append('images', f));
+  formData.append('target_language', targetLanguage);
+  formData.append('style', style);
+
+  const response = await fetch(`${API_BASE_URL}/api/process/batch/async`, {
+    method: 'POST',
+    body: formData,
+  });
+  return response.json();
+}
+
+export async function getJob(jobId: string): Promise<JobStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/job/${jobId}`);
   return response.json();
 }

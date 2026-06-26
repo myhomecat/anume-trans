@@ -3,6 +3,8 @@ from fastapi.responses import FileResponse
 import os
 import uuid
 import zipfile
+import asyncio
+import json
 from typing import List
 import aiofiles
 from PIL import Image, ImageDraw, ImageFont
@@ -805,7 +807,7 @@ async def process_batch(
     """다중 이미지 처리 + ZIP 패키징 (2-phase).
 
     Phase A: 전 이미지 감지+OCR로 텍스트만 수집
-    Phase B: 모든 텍스트를 1회 번역 (claude CLI 부팅 N→1로 단축)
+    Phase B: 전체 텍스트를 청크 병렬 번역 (claude CLI 동시 호출)
     Phase C: 이미지별 inpaint+render, ZIP 패키징
     """
     import time
@@ -851,7 +853,7 @@ async def process_batch(
         collected.append(entry)
     print(f"[BATCH] Phase A (감지+OCR) {len(images)}장: {time.time()-t0:.2f}s")
 
-    # ---- Phase B: 전체 텍스트 1회 번역 ----
+    # ---- Phase B: 전체 텍스트 청크 병렬 번역 ----
     t1 = time.time()
     flat = []
     idxmap = []  # (collected_idx, item_idx)
@@ -867,7 +869,9 @@ async def process_batch(
         collected[ci]["items"][ii]["translated"] = (
             translations[k] if k < len(translations) else collected[ci]["items"][ii]["original"]
         )
-    print(f"[BATCH] Phase B (번역 1회, 텍스트 {len(flat)}개): {time.time()-t1:.2f}s")
+    import math as _m
+    _chunks = _m.ceil(len(flat) / 15) if len(flat) > 15 else (1 if flat else 0)
+    print(f"[BATCH] Phase B (번역 {_chunks}청크 병렬, 텍스트 {len(flat)}개): {time.time()-t1:.2f}s")
 
     # ---- Phase C: 이미지별 inpaint + render + ZIP ----
     t2 = time.time()
@@ -915,6 +919,162 @@ async def process_batch(
 
     return {"success": True, "batch_id": batch_id, "count": len(images),
             "results": results, "zip_url": zip_url}
+
+
+# ===== 비동기 Job (브라우저 닫아도 백그라운드 처리) =====
+JOBS = {}  # job_id -> 상태 dict (메모리). status.json으로 디스크 영속(재시작 생존)
+
+
+def _job_status_path(batch_id):
+    return os.path.join(settings.OUTPUT_DIR, batch_id, "status.json")
+
+
+def _persist_job(batch_id):
+    """results의 TextItem은 직렬화 위해 제외하고 핵심 상태만 디스크에 기록."""
+    j = JOBS.get(batch_id)
+    if not j:
+        return
+    slim = {k: j[k] for k in ("status", "phase", "total", "done", "zip_url", "error", "count")}
+    slim["results"] = [
+        {"filename": r.get("filename"), "success": r.get("success"),
+         "output_url": r.get("output_url"), "n_texts": len(r.get("texts") or []),
+         "error": r.get("error")}
+        for r in j.get("results", [])
+    ]
+    try:
+        with open(_job_status_path(batch_id), "w", encoding="utf-8") as fp:
+            json.dump(slim, fp, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+async def _run_batch_job(batch_id, entries, target_language):
+    """저장된 입력 경로들로 Phase A/B/C 실행하며 JOBS 진행상태 갱신."""
+    j = JOBS[batch_id]
+    j["status"] = "processing"
+    try:
+        # Phase A: 감지 + OCR
+        j["phase"] = "detect"
+        for i, e in enumerate(entries):
+            try:
+                bubbles = detect_speech_bubbles(e["input_path"])
+                img_pil = Image.open(e["input_path"])
+                if img_pil.mode != 'RGB':
+                    img_pil = img_pil.convert('RGB')
+                e["w"], e["h"] = img_pil.size
+                for (x, y, w, h, contour) in bubbles:
+                    cropped = img_pil.crop((x, y, x + w, y + h))
+                    text = ocr_service.extract_from_pil(cropped)
+                    if text and text.strip():
+                        e["items"].append({"original": text.strip(),
+                                           "region": {"x": x, "y": y, "w": w, "h": h},
+                                           "contour": contour})
+            except Exception as ex:
+                e["error"] = str(ex)
+            j["done"] = i + 1
+            _persist_job(batch_id)
+
+        # Phase B: 청크 병렬 번역
+        j["phase"] = "translate"; j["done"] = 0; _persist_job(batch_id)
+        flat, idxmap = [], []
+        for ci, e in enumerate(entries):
+            for ii, it in enumerate(e["items"]):
+                flat.append(it["original"]); idxmap.append((ci, ii))
+        translations = await translate_service.translate_batch_parallel(flat, target_language=target_language) if flat else []
+        for k, (ci, ii) in enumerate(idxmap):
+            entries[ci]["items"][ii]["translated"] = translations[k] if k < len(translations) else entries[ci]["items"][ii]["original"]
+
+        # Phase C: 렌더 + ZIP
+        j["phase"] = "render"; j["done"] = 0; _persist_job(batch_id)
+        results, zip_members = [], []
+        for idx, e in enumerate(entries):
+            if e.get("error"):
+                results.append({"filename": e["orig_name"], "success": False, "error": e["error"]})
+            else:
+                try:
+                    texts, render_items = [], []
+                    for it in e["items"]:
+                        region = it["region"]; translated = it.get("translated", it["original"])
+                        texts.append(TextItem(original=it["original"], translated=translated,
+                                              location=f"({region['x']}, {region['y']})", type="dialogue",
+                                              region=Region(x=region["x"], y=region["y"], width=region["w"], height=region["h"])))
+                        render_items.append({"translated": translated, "original": it["original"],
+                                             "region": region, "contour": it["contour"]})
+                    output_url = None
+                    if render_items:
+                        output_path = os.path.join(e["job_output_dir"], "output.png")
+                        await render_with_inpainting(e["input_path"], render_items, output_path)
+                        output_url = f"/outputs/{e['job_id']}/output.png"
+                        stem = os.path.splitext(e["orig_name"])[0]
+                        zip_members.append((f"{idx + 1:02d}_{stem}_translated.png", output_path))
+                    results.append({"filename": e["orig_name"], "success": True, "output_url": output_url,
+                                    "texts": texts, "image_width": e["w"], "image_height": e["h"]})
+                except Exception as ex:
+                    results.append({"filename": e["orig_name"], "success": False, "error": str(ex)})
+            j["done"] = idx + 1; j["results"] = results; _persist_job(batch_id)
+
+        zip_url = None
+        if zip_members:
+            zip_path = os.path.join(settings.OUTPUT_DIR, batch_id, "result.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for arc, fp in zip_members:
+                    zf.write(fp, arcname=arc)
+            zip_url = f"/outputs/{batch_id}/result.zip"
+
+        j["results"] = results; j["zip_url"] = zip_url; j["status"] = "done"
+        _persist_job(batch_id)
+    except Exception as ex:
+        import traceback; traceback.print_exc()
+        j["status"] = "error"; j["error"] = str(ex); _persist_job(batch_id)
+
+
+@router.post("/process/batch/async")
+async def process_batch_async(
+    images: List[UploadFile] = File(...),
+    target_language: str = Form(default="한국어"),
+    style: str = Form(default="manga"),
+):
+    """업로드를 저장하고 job_id를 즉시 반환. 처리는 백그라운드(브라우저 닫아도 진행)."""
+    batch_id = str(uuid.uuid4())
+    os.makedirs(os.path.join(settings.OUTPUT_DIR, batch_id), exist_ok=True)
+    # 업로드는 응답 전에 반드시 디스크로 저장 (요청 종료 후엔 못 읽음)
+    entries = []
+    for idx, image in enumerate(images):
+        sub = f"{batch_id}_{idx}"
+        up = os.path.join(settings.UPLOAD_DIR, sub); out = os.path.join(settings.OUTPUT_DIR, sub)
+        os.makedirs(up, exist_ok=True); os.makedirs(out, exist_ok=True)
+        orig_name = os.path.basename(image.filename or f"image_{idx}")
+        ext = os.path.splitext(orig_name)[1] or ".png"
+        ip = os.path.join(up, f"input{ext}")
+        async with aiofiles.open(ip, 'wb') as fobj:
+            await fobj.write(await image.read())
+        entries.append({"orig_name": orig_name, "input_path": ip, "job_id": sub,
+                        "job_output_dir": out, "items": [], "w": 0, "h": 0, "error": None})
+
+    JOBS[batch_id] = {"status": "queued", "phase": "queued", "total": len(images),
+                      "done": 0, "count": len(images), "results": [], "zip_url": None, "error": None}
+    _persist_job(batch_id)
+    asyncio.create_task(_run_batch_job(batch_id, entries, target_language))
+    return {"job_id": batch_id, "status": "queued", "total": len(images)}
+
+
+@router.get("/job/{job_id}")
+async def get_job(job_id: str):
+    """Job 진행상태/결과 조회. 메모리에 없으면 디스크 status.json 폴백(재시작 생존)."""
+    j = JOBS.get(job_id)
+    if j:
+        return {"job_id": job_id, "status": j["status"], "phase": j["phase"],
+                "total": j["total"], "done": j["done"], "zip_url": j["zip_url"],
+                "error": j["error"],
+                "results": [{"filename": r.get("filename"), "success": r.get("success"),
+                             "output_url": r.get("output_url"), "n_texts": len(r.get("texts") or []),
+                             "error": r.get("error")} for r in j.get("results", [])]}
+    p = _job_status_path(job_id)
+    if os.path.exists(p):
+        with open(p, encoding="utf-8") as fp:
+            d = json.load(fp); d["job_id"] = job_id; return d
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail="job not found")
 
 
 @router.get("/download/{job_id}/{filename}")

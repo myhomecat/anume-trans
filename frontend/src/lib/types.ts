@@ -64,3 +64,22 @@ export interface BatchResponse {
   results: BatchItemResult[];
   zip_url?: string | null;
 }
+
+export interface JobResultItem {
+  filename: string;
+  success: boolean;
+  output_url?: string;
+  n_texts?: number;
+  error?: string;
+}
+
+export interface JobStatus {
+  job_id: string;
+  status: 'queued' | 'processing' | 'done' | 'error';
+  phase?: string;
+  total: number;
+  done: number;
+  zip_url?: string | null;
+  error?: string | null;
+  results?: JobResultItem[];
+}
