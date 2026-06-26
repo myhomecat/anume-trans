@@ -1039,8 +1039,7 @@ async def _run_batch_job(batch_id, entries, target_language):
                         output_path = os.path.join(e["job_output_dir"], "output.png")
                         await render_with_inpainting(e["input_path"], render_items, output_path)
                         output_url = f"/outputs/{e['job_id']}/output.png"
-                        stem = os.path.splitext(e["orig_name"])[0]
-                        zip_members.append((f"{idx + 1:02d}_{stem}_translated.png", output_path))
+                        zip_members.append((f"KO_{e['orig_name']}", output_path))
                     results.append({"filename": e["orig_name"], "success": True, "output_url": output_url,
                                     "texts": texts, "image_width": e["w"], "image_height": e["h"]})
                 except Exception as ex:
