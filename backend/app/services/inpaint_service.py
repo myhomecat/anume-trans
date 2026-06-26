@@ -1,8 +1,34 @@
-"""OpenCV 기반 Inpainting 서비스"""
+"""Inpainting 서비스 — LaMa(딥러닝) 우선, 실패 시 OpenCV TELEA 폴백"""
 import asyncio
 import cv2
 import numpy as np
 from typing import Optional
+from PIL import Image
+
+try:
+    import torch
+    _LAMA_DEVICE = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+except Exception:
+    _LAMA_DEVICE = "cpu"
+
+_simple_lama = None
+
+
+def _get_lama():
+    """SimpleLama 지연 로딩 (최초 호출 시 모델 다운로드). 실패하면 None."""
+    global _simple_lama
+    if _simple_lama is None:
+        try:
+            from simple_lama_inpainting import SimpleLama
+            try:
+                _simple_lama = SimpleLama(device=_LAMA_DEVICE)
+            except Exception:
+                _simple_lama = SimpleLama(device="cpu")  # MPS 미지원 연산 시 CPU
+            print(f"[InpaintService] LaMa loaded (device={_LAMA_DEVICE})")
+        except Exception as e:
+            print(f"[InpaintService] LaMa load 실패 → OpenCV 폴백: {e}")
+            _simple_lama = False  # 로드 실패 표시 (재시도 방지)
+    return _simple_lama or None
 
 
 class InpaintService:
@@ -33,7 +59,21 @@ class InpaintService:
         Returns:
             텍스트가 제거된 이미지
         """
-        # OpenCV TELEA 알고리즘 사용 (반경 증가로 더 완전한 제거)
+        # 1) LaMa 시도 (그림/배경 위 텍스트까지 자연스럽게 복원)
+        lama = _get_lama()
+        if lama is not None and mask.any():
+            try:
+                img_rgb = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+                mask_pil = Image.fromarray(mask).convert("L")
+                out = lama(img_rgb, mask_pil)
+                out_np = np.array(out.convert("RGB"))
+                # LaMa 출력 크기가 다를 수 있어 원본에 맞춤
+                if out_np.shape[:2] != image.shape[:2]:
+                    out_np = cv2.resize(out_np, (image.shape[1], image.shape[0]))
+                return cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                print(f"[InpaintService] LaMa inpaint 실패 → OpenCV 폴백: {e}")
+        # 2) OpenCV TELEA 폴백
         result = cv2.inpaint(image, mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
         return result
 
