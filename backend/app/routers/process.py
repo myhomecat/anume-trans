@@ -3,6 +3,8 @@ from fastapi.responses import FileResponse
 import os
 import uuid
 import zipfile
+import shutil
+import time
 import asyncio
 import json
 from typing import List
@@ -22,6 +24,7 @@ from app.services.ocr_service import OCRService
 from app.services.inpaint_service import inpaint_service
 from app.services.sam_service import get_sam_service
 from app.services import push_service
+from app.services import email_service
 
 router = APIRouter()
 
@@ -926,6 +929,36 @@ async def process_batch(
 JOBS = {}  # job_id -> 상태 dict
 PUSH_SUBS = {}  # job_id -> web push subscription (메모리). status.json으로 디스크 영속(재시작 생존)
 
+CLEANUP_TTL_DAYS = 3  # outputs(결과/ZIP) 보관 기간
+_cleanup_started = False
+
+
+async def _cleanup_loop():
+    """오래된 outputs/uploads 폴더를 주기적으로 삭제 (디스크 무한증가 방지)."""
+    while True:
+        try:
+            cutoff = time.time() - CLEANUP_TTL_DAYS * 86400
+            for base in (settings.OUTPUT_DIR, settings.UPLOAD_DIR):
+                if not os.path.isdir(base):
+                    continue
+                for name in os.listdir(base):
+                    p = os.path.join(base, name)
+                    try:
+                        if os.path.isdir(p) and os.path.getmtime(p) < cutoff:
+                            shutil.rmtree(p, ignore_errors=True)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[cleanup] error: {e}")
+        await asyncio.sleep(3600)  # 1시간마다
+
+
+def _ensure_cleanup():
+    global _cleanup_started
+    if not _cleanup_started:
+        _cleanup_started = True
+        asyncio.create_task(_cleanup_loop())
+
 
 def _job_status_path(batch_id):
     return os.path.join(settings.OUTPUT_DIR, batch_id, "status.json")
@@ -1023,14 +1056,28 @@ async def _run_batch_job(batch_id, entries, target_language):
                     zf.write(fp, arcname=arc)
             zip_url = f"/outputs/{batch_id}/result.zip"
 
+        # 입력 원본(uploads) 즉시 삭제 — 렌더 끝나면 불필요
+        for e in entries:
+            try:
+                shutil.rmtree(os.path.dirname(e["input_path"]), ignore_errors=True)
+            except Exception:
+                pass
         j["results"] = results; j["zip_url"] = zip_url; j["status"] = "done"
         _persist_job(batch_id)
         # 완료 푸시 (구독돼 있으면)
         sub = PUSH_SUBS.get(batch_id)
+        print(f"[push] job {batch_id} done -> sub={'YES' if sub else 'NO'}")
         if sub:
             ok_n = sum(1 for r in results if r.get("success"))
             push_service.send_push(sub, "만화 번역 완료",
                                     f"{ok_n}/{len(results)}장 번역 완료 — 클릭해 다운로드", url="/")
+        if j.get("email_notify"):
+            ok_n2 = sum(1 for r in results if r.get("success"))
+            from app.config import settings as _st
+            email_service.send_email(
+                "만화 번역 완료",
+                f"{ok_n2}/{len(results)}장 번역이 완료되었습니다.\n\n결과 확인/다운로드:\n{_st.PUBLIC_URL}\n",
+            )
     except Exception as ex:
         import traceback; traceback.print_exc()
         j["status"] = "error"; j["error"] = str(ex); _persist_job(batch_id)
@@ -1041,8 +1088,10 @@ async def process_batch_async(
     images: List[UploadFile] = File(...),
     target_language: str = Form(default="한국어"),
     style: str = Form(default="manga"),
+    email_notify: str = Form(default="false"),
 ):
     """업로드를 저장하고 job_id를 즉시 반환. 처리는 백그라운드(브라우저 닫아도 진행)."""
+    _ensure_cleanup()
     batch_id = str(uuid.uuid4())
     os.makedirs(os.path.join(settings.OUTPUT_DIR, batch_id), exist_ok=True)
     # 업로드는 응답 전에 반드시 디스크로 저장 (요청 종료 후엔 못 읽음)
@@ -1060,7 +1109,8 @@ async def process_batch_async(
                         "job_output_dir": out, "items": [], "w": 0, "h": 0, "error": None})
 
     JOBS[batch_id] = {"status": "queued", "phase": "queued", "total": len(images),
-                      "done": 0, "count": len(images), "results": [], "zip_url": None, "error": None}
+                      "done": 0, "count": len(images), "results": [], "zip_url": None, "error": None,
+                      "email_notify": (str(email_notify).lower() == "true")}
     _persist_job(batch_id)
     asyncio.create_task(_run_batch_job(batch_id, entries, target_language))
     return {"job_id": batch_id, "status": "queued", "total": len(images)}
@@ -1102,6 +1152,7 @@ async def push_subscribe(payload: dict = Body(...)):
     PUSH_SUBS[job_id] = sub
     # 구독 도착 전에 이미 끝난 경우 즉시 발송
     j = JOBS.get(job_id)
+    print(f"[push] subscribe job={job_id} status={(j or {}).get('status','none')}")
     if j and j.get("status") == "done":
         ok_n = sum(1 for r in j.get("results", []) if r.get("success"))
         push_service.send_push(sub, "만화 번역 완료",

@@ -70,7 +70,8 @@ export default function Home() {
   const [saved, setSaved] = useState<SavedJob[]>([]);
   const [statuses, setStatuses] = useState<Record<string, JobStatus>>({});
   const [error, setError] = useState<string | null>(null);
-  const [notify, setNotify] = useState(true);
+  const [notifyPush, setNotifyPush] = useState(true);
+  const [notifyEmail, setNotifyEmail] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // 마운트 시 localStorage에서 "내 작업" 복원
@@ -134,7 +135,7 @@ export default function Home() {
     setSubmitting(true);
     setError(null);
     try {
-      const res = await submitBatchAsync(picked.map((p) => p.file));
+      const res = await submitBatchAsync(picked.map((p) => p.file), { emailNotify: notifyEmail });
       const label =
         picked.length === 1 ? picked[0].file.name : `${picked.length}장 (${picked[0].file.name} 외)`;
       const job: SavedJob = { job_id: res.job_id, total: res.total, label, created: Date.now() };
@@ -142,7 +143,7 @@ export default function Home() {
       saveSaved(next);
       setSaved(next);
       setPicked([]); // 제출 후 선택 초기화 — 브라우저 닫아도 "내 작업"에서 추적됨
-      if (notify) {
+      if (notifyPush) {
         try {
           const sub = await ensurePushSubscription();
           if (sub) await subscribePush(res.job_id, sub);
@@ -195,10 +196,16 @@ export default function Home() {
             </div>
           )}
 
-          <label className="flex items-center gap-2 mt-4 text-sm text-gray-700 select-none cursor-pointer">
-            <input type="checkbox" checked={notify} onChange={(e) => setNotify(e.target.checked)} />
-            완료 시 브라우저 알림 받기 (탭 닫아도 옴)
-          </label>
+          <div className="mt-4 space-y-2">
+            <label className="flex items-center gap-2 text-sm text-gray-700 select-none cursor-pointer">
+              <input type="checkbox" checked={notifyPush} onChange={(e) => setNotifyPush(e.target.checked)} />
+              웹 알림 (브라우저, 탭 닫아도 옴)
+            </label>
+            <label className="flex items-center gap-2 text-sm text-gray-700 select-none cursor-pointer">
+              <input type="checkbox" checked={notifyEmail} onChange={(e) => setNotifyEmail(e.target.checked)} />
+              이메일 알림 (완료 시 1통)
+            </label>
+          </div>
           <button
             onClick={handleSubmit}
             disabled={picked.length === 0 || submitting}

@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # CORS 허용 origin (쉼표 구분, .env로 오버라이드 — IP 하드코딩 금지)
     CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
 
+    # SMTP 이메일 알림 (.env로 주입 — 비번은 Gmail 앱 비밀번호)
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 465
+    SMTP_USER: str = ""
+    SMTP_PASS: str = ""
+    SMTP_FROM: str = ""
+    SMTP_TO: str = ""
+    PUBLIC_URL: str = "https://manga-trans.pgchae.my"
+
     class Config:
         env_file = ".env"
 
