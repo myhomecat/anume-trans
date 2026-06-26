@@ -124,6 +124,52 @@ def estimate_original_font_size(text_mask: np.ndarray, region: dict, original_te
     return max(10, min(estimated_size, 40))
 
 
+def _iou(a, b):
+    ax1, ay1, ax2, ay2 = a[:4]; bx1, by1, bx2, by2 = b[:4]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1); ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1); inter = iw * ih
+    ua = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
+def _nms(boxes, iou_thresh=0.5):
+    boxes = sorted(boxes, key=lambda b: b[4], reverse=True)
+    keep = []
+    for b in boxes:
+        if all(_iou(b, k) < iou_thresh for k in keep):
+            keep.append(b)
+    return keep
+
+
+def _predict_boxes(detector, image_path, conf):
+    """YOLO 예측 → [(x1,y1,x2,y2,conf)]. 긴 세로(웹툰) 이미지는 슬라이스해 정확도 유지."""
+    img = Image.open(image_path)
+    W, H = img.size
+    boxes = []
+    if H <= W * 2.0:  # 일반 페이지
+        for r in detector.predict(source=image_path, conf=conf, device=DEVICE, verbose=False):
+            for b in r.boxes:
+                x1, y1, x2, y2 = b.xyxy[0].tolist()
+                boxes.append((x1, y1, x2, y2, b.conf[0].item()))
+        return boxes
+    # 웹툰 긴 strip: 패널 단위 슬라이스 (높이~너비*1.5, 15% 겹침)
+    print(f"[DEBUG] 웹툰 긴 이미지({W}x{H}) → 패널 슬라이스 감지")
+    img_rgb = img.convert("RGB")
+    panel_h = max(int(W * 1.5), 640); overlap = int(panel_h * 0.15); step = max(1, panel_h - overlap)
+    y = 0
+    while y < H:
+        y2c = min(y + panel_h, H)
+        crop = img_rgb.crop((0, y, W, y2c))
+        for r in detector.predict(source=crop, conf=conf, device=DEVICE, verbose=False):
+            for b in r.boxes:
+                bx1, by1, bx2, by2 = b.xyxy[0].tolist()
+                boxes.append((bx1, by1 + y, bx2, by2 + y, b.conf[0].item()))
+        if y2c >= H:
+            break
+        y += step
+    return _nms(boxes, iou_thresh=0.5)
+
+
 _text_detector = None
 
 
@@ -142,22 +188,20 @@ def detect_free_text(image_path: str, bubbles: list, conf_threshold: float = 0.3
     """말풍선과 겹치지 않는 텍스트 영역(효과음/나레이션) 감지. (x,y,w,h,None) 리스트."""
     try:
         det = _get_text_detector()
-        results = det.predict(source=image_path, conf=conf_threshold, device=DEVICE, verbose=False)
+        raw = _predict_boxes(det, image_path, conf_threshold)
     except Exception as e:
         print(f"[DEBUG] free-text detect 실패: {e}")
         return []
     free = []
-    for result in results:
-        for box in result.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-            if w <= 0 or h <= 0:
-                continue
-            cx, cy = x + w / 2, y + h / 2
-            inside_bubble = any(bx <= cx <= bx + bw and by <= cy <= by + bh
-                                for (bx, by, bw, bh, _) in bubbles)
-            if not inside_bubble:
-                free.append((x, y, w, h, None))
+    for (x1, y1, x2, y2, c) in raw:
+        x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+        if w <= 0 or h <= 0:
+            continue
+        cx, cy = x + w / 2, y + h / 2
+        inside_bubble = any(bx <= cx <= bx + bw and by <= cy <= by + bh
+                            for (bx, by, bw, bh, _) in bubbles)
+        if not inside_bubble:
+            free.append((x, y, w, h, None))
     print(f"[DEBUG] Free text (말풍선 밖): {len(free)}")
     return free
 
@@ -171,21 +215,8 @@ def detect_speech_bubbles(image_path: str, conf_threshold: float = 0.3) -> list:
     """
     print(f"[DEBUG] Detecting speech bubbles with YOLOv8...")
 
-    # YOLOv8로 감지
-    results = bubble_detector.predict(source=image_path, conf=conf_threshold, device=DEVICE, verbose=False)
-
-    bubbles = []
-    for result in results:
-        for box in result.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            conf = box.conf[0].item()
-
-            x, y = int(x1), int(y1)
-            w, h = int(x2 - x1), int(y2 - y1)
-
-            bubbles.append((x, y, w, h, None))
-            print(f"[DEBUG] Bubble found: ({x}, {y}, {w}, {h}), conf={conf:.2f}")
-
+    raw = _predict_boxes(bubble_detector, image_path, conf_threshold)
+    bubbles = [(int(x1), int(y1), int(x2 - x1), int(y2 - y1), None) for (x1, y1, x2, y2, c) in raw]
     print(f"[DEBUG] Found {len(bubbles)} speech bubbles")
 
     # y좌표로 정렬 (위에서 아래로, 왼쪽에서 오른쪽으로)
