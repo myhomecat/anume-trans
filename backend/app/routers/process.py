@@ -354,7 +354,7 @@ def render_horizontal_text(draw, text: str, x: int, y: int, w: int, h: int):
     text_len = len(text)
 
     # 말풍선을 채우도록 큰 크기에서 시작해 맞을 때까지 축소 (상한 제거 → 큰 풍선엔 큰 글씨)
-    font_size = max(12, min(int(h * 0.9), 64))
+    font_size = max(12, min(int(h * 0.8), 56))
     font = get_font(font_size)
 
     # 단어 단위 줄바꿈
@@ -558,8 +558,8 @@ async def render_text_on_bubbles(
         if not translated or w <= 10 or h <= 10:
             continue
 
-        # 패딩 적용 (말풍선 테두리 안쪽으로)
-        padding = 8
+        # 패딩 적용 (말풍선 테두리 안쪽으로, 크기 비례)
+        padding = max(8, int(min(w, h) * 0.13))
         inner_x = x + padding
         inner_y = y + padding
         inner_w = w - padding * 2
@@ -579,6 +579,31 @@ async def render_text_on_bubbles(
     # 저장
     img_pil.save(output_path)
     return output_path
+
+
+def _mask_inner_rect(bubble_mask, x, y, w, h, inside_ratio=0.32):
+    """말풍선 SAM 마스크에서 글씨가 안전하게 들어갈 내접 영역 계산 (모양 적응).
+    거리변환으로 외곽에서 충분히 떨어진 안쪽만 사용 → 둥근/이형 말풍선도 안 넘침.
+    마스크가 없으면(효과음 등) None 반환 → 호출부에서 비례패딩 폴백."""
+    H, W = bubble_mask.shape[:2]
+    x0, y0 = max(0, int(x)), max(0, int(y))
+    x1, y1 = min(W, int(x + w)), min(H, int(y + h))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    roi = bubble_mask[y0:y1, x0:x1]
+    if roi.size == 0 or int(roi.max()) == 0:
+        return None
+    binroi = (roi > 0).astype(np.uint8)
+    dist = cv2.distanceTransform(binroi, cv2.DIST_L2, 5)
+    md = float(dist.max())
+    if md <= 1:
+        return None
+    inside = (dist >= md * inside_ratio).astype(np.uint8)
+    ys, xs = np.where(inside)
+    if len(xs) == 0:
+        return None
+    ix0, iy0, ix1, iy1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+    return (x0 + ix0, y0 + iy0, ix1 - ix0 + 1, iy1 - iy0 + 1)
 
 
 async def render_with_inpainting(
@@ -671,13 +696,13 @@ async def render_with_inpainting(
         if not translated or w <= 10 or h <= 10:
             continue
 
-        # 패딩 적용 (말풍선 테두리 안쪽으로) - 더 큰 패딩으로 안전하게
-        padding = 12
-        inner_x = x + padding
-        inner_y = y + padding
-        inner_w = w - padding * 2
-        inner_h = h - padding * 2
-
+        # SAM 마스크 기반 안전 영역 (말풍선 모양 따라 자동). 마스크 없으면 비례패딩 폴백.
+        rect = _mask_inner_rect(bubble_mask, x, y, w, h)
+        if rect is not None:
+            inner_x, inner_y, inner_w, inner_h = rect
+        else:
+            pad = max(10, int(min(w, h) * 0.12))
+            inner_x, inner_y, inner_w, inner_h = x + pad, y + pad, w - pad * 2, h - pad * 2
         if inner_w <= 0 or inner_h <= 0:
             continue
 
