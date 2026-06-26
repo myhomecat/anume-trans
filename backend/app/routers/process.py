@@ -903,8 +903,7 @@ async def process_batch(
                 output_path = os.path.join(c["job_output_dir"], "output.png")
                 await render_with_inpainting(c["input_path"], render_items, output_path)
                 output_url = f"/outputs/{c['job_id']}/output.png"
-                stem = os.path.splitext(orig_name)[0]
-                zip_members.append((f"{idx + 1:02d}_{stem}_translated.png", output_path))
+                zip_members.append((f"KO_{orig_name}", output_path))
             results.append({"filename": orig_name, "success": True, "output_url": output_url,
                             "texts": texts, "image_width": c["w"], "image_height": c["h"]})
         except Exception as e:
@@ -1071,12 +1070,14 @@ async def _run_batch_job(batch_id, entries, target_language):
             ok_n = sum(1 for r in results if r.get("success"))
             push_service.send_push(sub, "만화 번역 완료",
                                     f"{ok_n}/{len(results)}장 번역 완료 — 클릭해 다운로드", url=f"/?job={batch_id}")
-        if j.get("email_notify"):
+        recipient = j.get("email")
+        if recipient:
             ok_n2 = sum(1 for r in results if r.get("success"))
             from app.config import settings as _st
             email_service.send_email(
                 "만화 번역 완료",
                 f"{ok_n2}/{len(results)}장 번역이 완료되었습니다.\n\n결과 확인/다운로드:\n{_st.PUBLIC_URL}/?job={batch_id}\n",
+                to=recipient,
             )
     except Exception as ex:
         import traceback; traceback.print_exc()
@@ -1088,7 +1089,7 @@ async def process_batch_async(
     images: List[UploadFile] = File(...),
     target_language: str = Form(default="한국어"),
     style: str = Form(default="manga"),
-    email_notify: str = Form(default="false"),
+    email: str = Form(default=""),
 ):
     """업로드를 저장하고 job_id를 즉시 반환. 처리는 백그라운드(브라우저 닫아도 진행)."""
     _ensure_cleanup()
@@ -1110,7 +1111,7 @@ async def process_batch_async(
 
     JOBS[batch_id] = {"status": "queued", "phase": "queued", "total": len(images),
                       "done": 0, "count": len(images), "results": [], "zip_url": None, "error": None,
-                      "email_notify": (str(email_notify).lower() == "true")}
+                      "email": (email or "").strip()}
     _persist_job(batch_id)
     asyncio.create_task(_run_batch_job(batch_id, entries, target_language))
     return {"job_id": batch_id, "status": "queued", "total": len(images)}

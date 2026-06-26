@@ -82,13 +82,13 @@ export async function processBatch(
 
 export async function submitBatchAsync(
   files: File[],
-  opts: { emailNotify?: boolean; targetLanguage?: string; style?: string } = {}
+  opts: { email?: string; targetLanguage?: string; style?: string } = {}
 ): Promise<{ job_id: string; status: string; total: number }> {
   const formData = new FormData();
   files.forEach((f) => formData.append('images', f));
   formData.append('target_language', opts.targetLanguage || '한국어');
   formData.append('style', opts.style || 'manga');
-  formData.append('email_notify', opts.emailNotify ? 'true' : 'false');
+  formData.append('email', opts.email || '');
 
   const response = await fetch(`${API_BASE_URL}/api/process/batch/async`, {
     method: 'POST',

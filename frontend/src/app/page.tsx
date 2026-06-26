@@ -72,6 +72,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [notifyPush, setNotifyPush] = useState(true);
   const [notifyEmail, setNotifyEmail] = useState(false);
+  const [email, setEmail] = useState('');
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // 마운트 시 localStorage 복원 + ?job= 딥링크(메일/알림에서 온 경우) 병합
@@ -136,12 +137,34 @@ export default function Home() {
 
   const removeAt = (idx: number) => setPicked((prev) => prev.filter((_, i) => i !== idx));
 
+  // 클립보드 이미지 붙여넣기(Ctrl+V) 지원
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const files: File[] = [];
+      const items = e.clipboardData?.items || [];
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (it.kind === 'file' && it.type.startsWith('image/')) {
+          const f = it.getAsFile();
+          if (f) {
+            const ext = (f.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+            files.push(new File([f], f.name || `pasted-${Date.now()}.${ext}`, { type: f.type }));
+          }
+        }
+      }
+      if (files.length) handleFilesSelect(files);
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleSubmit = async () => {
     if (picked.length === 0) return;
     setSubmitting(true);
     setError(null);
     try {
-      const res = await submitBatchAsync(picked.map((p) => p.file), { emailNotify: notifyEmail });
+      const res = await submitBatchAsync(picked.map((p) => p.file), { email: notifyEmail ? email.trim() : '' });
       const label =
         picked.length === 1 ? picked[0].file.name : `${picked.length}장 (${picked[0].file.name} 외)`;
       const job: SavedJob = { job_id: res.job_id, total: res.total, label, created: Date.now() };
@@ -211,6 +234,15 @@ export default function Home() {
               <input type="checkbox" checked={notifyEmail} onChange={(e) => setNotifyEmail(e.target.checked)} />
               이메일 알림 (완료 시 1통)
             </label>
+            {notifyEmail && (
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="받을 이메일 주소"
+                className="ml-6 w-64 max-w-full px-2 py-1 border rounded text-sm"
+              />
+            )}
           </div>
           <button
             onClick={handleSubmit}
@@ -260,7 +292,7 @@ export default function Home() {
                         </a>
                       )}
                       {done && ok.length === 1 && ok[0].output_url && (
-                        <a href={getOutputUrl(ok[0].output_url)} download
+                        <a href={getOutputUrl(ok[0].output_url)} download={`KO_${ok[0].filename}`}
                           className="py-2 px-3 bg-green-500 hover:bg-green-600 text-white rounded-lg text-sm font-medium">
                           이미지 다운로드
                         </a>
