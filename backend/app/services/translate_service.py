@@ -1,6 +1,7 @@
 import subprocess
 import asyncio
 import json
+import math
 from typing import Optional, List
 
 from app.config import settings
@@ -93,6 +94,42 @@ class TranslateService:
                 translations.append(translation.strip())
 
         return translations
+
+    async def translate_batch_parallel(
+        self,
+        texts: List[str],
+        target_language: str = "한국어",
+        style: TranslateStyle = TranslateStyle.MANGA,
+        chunk_size: int = 15,
+        concurrency: int = 4,
+    ) -> List[str]:
+        """텍스트를 청크로 나눠 claude CLI를 병렬 호출 (독립 프로세스, 동시성 제한).
+
+        단일 호출(텍스트 수에 비례해 느림) 대비, 청크를 동시에 번역해 벽시계 시간 단축.
+        청크별로 길이에 맞춰 정렬해 전역 인덱스 어긋남을 방지한다.
+        """
+        if not texts:
+            return []
+        if len(texts) <= chunk_size:
+            return await self.translate_batch(texts, target_language, style)
+
+        chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+        sem = asyncio.Semaphore(concurrency)
+
+        async def run(chunk):
+            async with sem:
+                return await self.translate_batch(chunk, target_language, style)
+
+        results = await asyncio.gather(*[run(c) for c in chunks], return_exceptions=True)
+
+        out = []
+        for chunk, res in zip(chunks, results):
+            if isinstance(res, Exception) or not isinstance(res, list):
+                out.extend(chunk)  # 실패 시 원문 폴백
+            else:
+                for i, original in enumerate(chunk):
+                    out.append(res[i] if i < len(res) else original)
+        return out
 
     async def analyze_and_translate_image(
         self,

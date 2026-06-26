@@ -1,7 +1,13 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Body
 from fastapi.responses import FileResponse
 import os
 import uuid
+import zipfile
+import shutil
+import time
+import asyncio
+import json
+from typing import List
 import aiofiles
 from PIL import Image, ImageDraw, ImageFont
 import textwrap
@@ -11,11 +17,14 @@ from ultralytics import YOLO
 from huggingface_hub import hf_hub_download
 
 from app.config import settings
+from app.device import DEVICE
 from app.models.schemas import ProcessResponse, TextItem, Region
 from app.services.translate_service import translate_service
 from app.services.ocr_service import OCRService
 from app.services.inpaint_service import inpaint_service
 from app.services.sam_service import get_sam_service
+from app.services import push_service
+from app.services import email_service
 
 router = APIRouter()
 
@@ -125,7 +134,7 @@ def detect_speech_bubbles(image_path: str, conf_threshold: float = 0.3) -> list:
     print(f"[DEBUG] Detecting speech bubbles with YOLOv8...")
 
     # YOLOv8로 감지
-    results = bubble_detector.predict(source=image_path, conf=conf_threshold, verbose=False)
+    results = bubble_detector.predict(source=image_path, conf=conf_threshold, device=DEVICE, verbose=False)
 
     bubbles = []
     for result in results:
@@ -747,6 +756,408 @@ async def process_image(
             job_id=job_id,
             error=str(e)
         )
+
+
+async def _run_pipeline(input_path, job_id, job_output_dir, file_ext, target_language):
+    """detection→OCR→번역(claude CLI)→inpaint→render 핵심 파이프라인. 배치에서 재사용."""
+    bubbles = detect_speech_bubbles(input_path)
+    print(f"[DEBUG] Found {len(bubbles)} speech bubbles")
+
+    img_pil = Image.open(input_path)
+    if img_pil.mode != 'RGB':
+        img_pil = img_pil.convert('RGB')
+
+    extracted_texts = []
+    for i, (x, y, w, h, contour) in enumerate(bubbles):
+        cropped = img_pil.crop((x, y, x + w, y + h))
+        text = ocr_service.extract_from_pil(cropped)
+        if text and text.strip():
+            extracted_texts.append({"original": text.strip(),
+                                    "region": {"x": x, "y": y, "w": w, "h": h},
+                                    "contour": contour})
+
+    texts = []
+    render_items = []
+    if extracted_texts:
+        originals = [item["original"] for item in extracted_texts]
+        translations = await translate_service.translate_batch(originals, target_language=target_language)
+        for i, item in enumerate(extracted_texts):
+            translated = translations[i] if i < len(translations) else item["original"]
+            region = item["region"]
+            texts.append(TextItem(original=item["original"], translated=translated,
+                                  location=f"({region['x']}, {region['y']})", type="dialogue",
+                                  region=Region(x=region["x"], y=region["y"], width=region["w"], height=region["h"])))
+            render_items.append({"translated": translated, "original": item["original"],
+                                 "region": region, "contour": item["contour"]})
+
+    img_width, img_height = img_pil.size
+    output_url = None
+    output_path = None
+    if render_items:
+        output_path = os.path.join(job_output_dir, "output.png")
+        await render_with_inpainting(input_path, render_items, output_path)
+        output_url = f"/outputs/{job_id}/output.png"
+
+    return {"texts": texts, "output_url": output_url, "output_path": output_path,
+            "image_width": img_width, "image_height": img_height}
+
+
+@router.post("/process/batch")
+async def process_batch(
+    images: List[UploadFile] = File(...),
+    target_language: str = Form(default="한국어"),
+    style: str = Form(default="manga"),
+):
+    """다중 이미지 처리 + ZIP 패키징 (2-phase).
+
+    Phase A: 전 이미지 감지+OCR로 텍스트만 수집
+    Phase B: 전체 텍스트를 청크 병렬 번역 (claude CLI 동시 호출)
+    Phase C: 이미지별 inpaint+render, ZIP 패키징
+    """
+    import time
+    batch_id = str(uuid.uuid4())
+    batch_output_dir = os.path.join(settings.OUTPUT_DIR, batch_id)
+    os.makedirs(batch_output_dir, exist_ok=True)
+
+    # ---- Phase A: 감지 + OCR (이미지별, MPS) ----
+    t0 = time.time()
+    collected = []  # 이미지별 컨텍스트
+    for idx, image in enumerate(images):
+        job_id = f"{batch_id}_{idx}"
+        job_upload_dir = os.path.join(settings.UPLOAD_DIR, job_id)
+        job_output_dir = os.path.join(settings.OUTPUT_DIR, job_id)
+        os.makedirs(job_upload_dir, exist_ok=True)
+        os.makedirs(job_output_dir, exist_ok=True)
+        orig_name = os.path.basename(image.filename or f"image_{idx}")
+        entry = {"job_id": job_id, "job_output_dir": job_output_dir,
+                 "orig_name": orig_name, "items": [], "w": 0, "h": 0, "error": None}
+        try:
+            file_ext = os.path.splitext(orig_name)[1] or ".png"
+            input_path = os.path.join(job_upload_dir, f"input{file_ext}")
+            async with aiofiles.open(input_path, 'wb') as fobj:
+                await fobj.write(await image.read())
+            entry["input_path"] = input_path
+
+            bubbles = detect_speech_bubbles(input_path)
+            img_pil = Image.open(input_path)
+            if img_pil.mode != 'RGB':
+                img_pil = img_pil.convert('RGB')
+            entry["w"], entry["h"] = img_pil.size
+            for (x, y, w, h, contour) in bubbles:
+                cropped = img_pil.crop((x, y, x + w, y + h))
+                text = ocr_service.extract_from_pil(cropped)
+                if text and text.strip():
+                    entry["items"].append({"original": text.strip(),
+                                           "region": {"x": x, "y": y, "w": w, "h": h},
+                                           "contour": contour})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            entry["error"] = str(e)
+        collected.append(entry)
+    print(f"[BATCH] Phase A (감지+OCR) {len(images)}장: {time.time()-t0:.2f}s")
+
+    # ---- Phase B: 전체 텍스트 청크 병렬 번역 ----
+    t1 = time.time()
+    flat = []
+    idxmap = []  # (collected_idx, item_idx)
+    for ci, c in enumerate(collected):
+        for ii, it in enumerate(c["items"]):
+            flat.append(it["original"])
+            idxmap.append((ci, ii))
+    if flat:
+        translations = await translate_service.translate_batch_parallel(flat, target_language=target_language)
+    else:
+        translations = []
+    for k, (ci, ii) in enumerate(idxmap):
+        collected[ci]["items"][ii]["translated"] = (
+            translations[k] if k < len(translations) else collected[ci]["items"][ii]["original"]
+        )
+    import math as _m
+    _chunks = _m.ceil(len(flat) / 15) if len(flat) > 15 else (1 if flat else 0)
+    print(f"[BATCH] Phase B (번역 {_chunks}청크 병렬, 텍스트 {len(flat)}개): {time.time()-t1:.2f}s")
+
+    # ---- Phase C: 이미지별 inpaint + render + ZIP ----
+    t2 = time.time()
+    results = []
+    zip_members = []
+    for idx, c in enumerate(collected):
+        orig_name = c["orig_name"]
+        if c["error"]:
+            results.append({"filename": orig_name, "success": False, "error": c["error"]})
+            continue
+        try:
+            texts = []
+            render_items = []
+            for it in c["items"]:
+                region = it["region"]
+                translated = it.get("translated", it["original"])
+                texts.append(TextItem(original=it["original"], translated=translated,
+                                      location=f"({region['x']}, {region['y']})", type="dialogue",
+                                      region=Region(x=region["x"], y=region["y"],
+                                                    width=region["w"], height=region["h"])))
+                render_items.append({"translated": translated, "original": it["original"],
+                                     "region": region, "contour": it["contour"]})
+            output_url = None
+            if render_items:
+                output_path = os.path.join(c["job_output_dir"], "output.png")
+                await render_with_inpainting(c["input_path"], render_items, output_path)
+                output_url = f"/outputs/{c['job_id']}/output.png"
+                zip_members.append((f"KO_{orig_name}", output_path))
+            results.append({"filename": orig_name, "success": True, "output_url": output_url,
+                            "texts": texts, "image_width": c["w"], "image_height": c["h"]})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            results.append({"filename": orig_name, "success": False, "error": str(e)})
+    print(f"[BATCH] Phase C (렌더+ZIP): {time.time()-t2:.2f}s")
+
+    zip_url = None
+    if zip_members:
+        zip_path = os.path.join(batch_output_dir, "result.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for arc, fp in zip_members:
+                zf.write(fp, arcname=arc)
+        zip_url = f"/outputs/{batch_id}/result.zip"
+
+    return {"success": True, "batch_id": batch_id, "count": len(images),
+            "results": results, "zip_url": zip_url}
+
+
+# ===== 비동기 Job (브라우저 닫아도 백그라운드 처리) =====
+JOBS = {}  # job_id -> 상태 dict
+PUSH_SUBS = {}  # job_id -> web push subscription (메모리). status.json으로 디스크 영속(재시작 생존)
+
+CLEANUP_TTL_DAYS = 3  # outputs(결과/ZIP) 보관 기간
+_cleanup_started = False
+
+
+async def _cleanup_loop():
+    """오래된 outputs/uploads 폴더를 주기적으로 삭제 (디스크 무한증가 방지)."""
+    while True:
+        try:
+            cutoff = time.time() - CLEANUP_TTL_DAYS * 86400
+            for base in (settings.OUTPUT_DIR, settings.UPLOAD_DIR):
+                if not os.path.isdir(base):
+                    continue
+                for name in os.listdir(base):
+                    p = os.path.join(base, name)
+                    try:
+                        if os.path.isdir(p) and os.path.getmtime(p) < cutoff:
+                            shutil.rmtree(p, ignore_errors=True)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[cleanup] error: {e}")
+        await asyncio.sleep(3600)  # 1시간마다
+
+
+def _ensure_cleanup():
+    global _cleanup_started
+    if not _cleanup_started:
+        _cleanup_started = True
+        asyncio.create_task(_cleanup_loop())
+
+
+def _job_status_path(batch_id):
+    return os.path.join(settings.OUTPUT_DIR, batch_id, "status.json")
+
+
+def _persist_job(batch_id):
+    """results의 TextItem은 직렬화 위해 제외하고 핵심 상태만 디스크에 기록."""
+    j = JOBS.get(batch_id)
+    if not j:
+        return
+    slim = {k: j[k] for k in ("status", "phase", "total", "done", "zip_url", "error", "count")}
+    slim["results"] = [
+        {"filename": r.get("filename"), "success": r.get("success"),
+         "output_url": r.get("output_url"), "n_texts": len(r.get("texts") or []),
+         "error": r.get("error")}
+        for r in j.get("results", [])
+    ]
+    try:
+        with open(_job_status_path(batch_id), "w", encoding="utf-8") as fp:
+            json.dump(slim, fp, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+async def _run_batch_job(batch_id, entries, target_language):
+    """저장된 입력 경로들로 Phase A/B/C 실행하며 JOBS 진행상태 갱신."""
+    j = JOBS[batch_id]
+    j["status"] = "processing"
+    try:
+        # Phase A: 감지 + OCR
+        j["phase"] = "detect"
+        for i, e in enumerate(entries):
+            try:
+                bubbles = detect_speech_bubbles(e["input_path"])
+                img_pil = Image.open(e["input_path"])
+                if img_pil.mode != 'RGB':
+                    img_pil = img_pil.convert('RGB')
+                e["w"], e["h"] = img_pil.size
+                for (x, y, w, h, contour) in bubbles:
+                    cropped = img_pil.crop((x, y, x + w, y + h))
+                    text = ocr_service.extract_from_pil(cropped)
+                    if text and text.strip():
+                        e["items"].append({"original": text.strip(),
+                                           "region": {"x": x, "y": y, "w": w, "h": h},
+                                           "contour": contour})
+            except Exception as ex:
+                e["error"] = str(ex)
+            j["done"] = i + 1
+            _persist_job(batch_id)
+
+        # Phase B: 청크 병렬 번역
+        j["phase"] = "translate"; j["done"] = 0; _persist_job(batch_id)
+        flat, idxmap = [], []
+        for ci, e in enumerate(entries):
+            for ii, it in enumerate(e["items"]):
+                flat.append(it["original"]); idxmap.append((ci, ii))
+        translations = await translate_service.translate_batch_parallel(flat, target_language=target_language) if flat else []
+        for k, (ci, ii) in enumerate(idxmap):
+            entries[ci]["items"][ii]["translated"] = translations[k] if k < len(translations) else entries[ci]["items"][ii]["original"]
+
+        # Phase C: 렌더 + ZIP
+        j["phase"] = "render"; j["done"] = 0; _persist_job(batch_id)
+        results, zip_members = [], []
+        for idx, e in enumerate(entries):
+            if e.get("error"):
+                results.append({"filename": e["orig_name"], "success": False, "error": e["error"]})
+            else:
+                try:
+                    texts, render_items = [], []
+                    for it in e["items"]:
+                        region = it["region"]; translated = it.get("translated", it["original"])
+                        texts.append(TextItem(original=it["original"], translated=translated,
+                                              location=f"({region['x']}, {region['y']})", type="dialogue",
+                                              region=Region(x=region["x"], y=region["y"], width=region["w"], height=region["h"])))
+                        render_items.append({"translated": translated, "original": it["original"],
+                                             "region": region, "contour": it["contour"]})
+                    output_url = None
+                    if render_items:
+                        output_path = os.path.join(e["job_output_dir"], "output.png")
+                        await render_with_inpainting(e["input_path"], render_items, output_path)
+                        output_url = f"/outputs/{e['job_id']}/output.png"
+                        zip_members.append((f"KO_{e['orig_name']}", output_path))
+                    results.append({"filename": e["orig_name"], "success": True, "output_url": output_url,
+                                    "texts": texts, "image_width": e["w"], "image_height": e["h"]})
+                except Exception as ex:
+                    results.append({"filename": e["orig_name"], "success": False, "error": str(ex)})
+            j["done"] = idx + 1; j["results"] = results; _persist_job(batch_id)
+
+        zip_url = None
+        if zip_members:
+            zip_path = os.path.join(settings.OUTPUT_DIR, batch_id, "result.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for arc, fp in zip_members:
+                    zf.write(fp, arcname=arc)
+            zip_url = f"/outputs/{batch_id}/result.zip"
+
+        # 입력 원본(uploads) 즉시 삭제 — 렌더 끝나면 불필요
+        for e in entries:
+            try:
+                shutil.rmtree(os.path.dirname(e["input_path"]), ignore_errors=True)
+            except Exception:
+                pass
+        j["results"] = results; j["zip_url"] = zip_url; j["status"] = "done"
+        _persist_job(batch_id)
+        # 완료 푸시 (구독돼 있으면)
+        sub = PUSH_SUBS.get(batch_id)
+        print(f"[push] job {batch_id} done -> sub={'YES' if sub else 'NO'}")
+        if sub:
+            ok_n = sum(1 for r in results if r.get("success"))
+            push_service.send_push(sub, "만화 번역 완료",
+                                    f"{ok_n}/{len(results)}장 번역 완료 — 클릭해 다운로드", url=f"/?job={batch_id}")
+        recipient = j.get("email")
+        if recipient:
+            ok_n2 = sum(1 for r in results if r.get("success"))
+            from app.config import settings as _st
+            email_service.send_email(
+                "만화 번역 완료",
+                f"{ok_n2}/{len(results)}장 번역이 완료되었습니다.\n\n결과 확인/다운로드:\n{_st.PUBLIC_URL}/?job={batch_id}\n",
+                to=recipient,
+            )
+    except Exception as ex:
+        import traceback; traceback.print_exc()
+        j["status"] = "error"; j["error"] = str(ex); _persist_job(batch_id)
+
+
+@router.post("/process/batch/async")
+async def process_batch_async(
+    images: List[UploadFile] = File(...),
+    target_language: str = Form(default="한국어"),
+    style: str = Form(default="manga"),
+    email: str = Form(default=""),
+):
+    """업로드를 저장하고 job_id를 즉시 반환. 처리는 백그라운드(브라우저 닫아도 진행)."""
+    _ensure_cleanup()
+    batch_id = str(uuid.uuid4())
+    os.makedirs(os.path.join(settings.OUTPUT_DIR, batch_id), exist_ok=True)
+    # 업로드는 응답 전에 반드시 디스크로 저장 (요청 종료 후엔 못 읽음)
+    entries = []
+    for idx, image in enumerate(images):
+        sub = f"{batch_id}_{idx}"
+        up = os.path.join(settings.UPLOAD_DIR, sub); out = os.path.join(settings.OUTPUT_DIR, sub)
+        os.makedirs(up, exist_ok=True); os.makedirs(out, exist_ok=True)
+        orig_name = os.path.basename(image.filename or f"image_{idx}")
+        ext = os.path.splitext(orig_name)[1] or ".png"
+        ip = os.path.join(up, f"input{ext}")
+        async with aiofiles.open(ip, 'wb') as fobj:
+            await fobj.write(await image.read())
+        entries.append({"orig_name": orig_name, "input_path": ip, "job_id": sub,
+                        "job_output_dir": out, "items": [], "w": 0, "h": 0, "error": None})
+
+    JOBS[batch_id] = {"status": "queued", "phase": "queued", "total": len(images),
+                      "done": 0, "count": len(images), "results": [], "zip_url": None, "error": None,
+                      "email": (email or "").strip()}
+    _persist_job(batch_id)
+    asyncio.create_task(_run_batch_job(batch_id, entries, target_language))
+    return {"job_id": batch_id, "status": "queued", "total": len(images)}
+
+
+@router.get("/job/{job_id}")
+async def get_job(job_id: str):
+    """Job 진행상태/결과 조회. 메모리에 없으면 디스크 status.json 폴백(재시작 생존)."""
+    j = JOBS.get(job_id)
+    if j:
+        return {"job_id": job_id, "status": j["status"], "phase": j["phase"],
+                "total": j["total"], "done": j["done"], "zip_url": j["zip_url"],
+                "error": j["error"],
+                "results": [{"filename": r.get("filename"), "success": r.get("success"),
+                             "output_url": r.get("output_url"), "n_texts": len(r.get("texts") or []),
+                             "error": r.get("error")} for r in j.get("results", [])]}
+    p = _job_status_path(job_id)
+    if os.path.exists(p):
+        with open(p, encoding="utf-8") as fp:
+            d = json.load(fp); d["job_id"] = job_id; return d
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail="job not found")
+
+
+@router.get("/push/key")
+async def push_key():
+    """브라우저 구독용 VAPID 공개키."""
+    return {"publicKey": push_service.public_key()}
+
+
+@router.post("/push/subscribe")
+async def push_subscribe(payload: dict = Body(...)):
+    """job_id에 대한 푸시 구독 저장. 이미 완료된 job이면 즉시 발송."""
+    job_id = payload.get("job_id")
+    sub = payload.get("subscription")
+    if not job_id or not sub:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="job_id, subscription 필요")
+    PUSH_SUBS[job_id] = sub
+    # 구독 도착 전에 이미 끝난 경우 즉시 발송
+    j = JOBS.get(job_id)
+    print(f"[push] subscribe job={job_id} status={(j or {}).get('status','none')}")
+    if j and j.get("status") == "done":
+        ok_n = sum(1 for r in j.get("results", []) if r.get("success"))
+        push_service.send_push(sub, "만화 번역 완료",
+                               f"{ok_n}장 번역 완료 — 클릭해 다운로드", url=f"/?job={job_id}")
+    return {"ok": True}
 
 
 @router.get("/download/{job_id}/{filename}")

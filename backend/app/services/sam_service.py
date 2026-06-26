@@ -6,6 +6,7 @@ import os
 import numpy as np
 import cv2
 import torch
+from app.device import DEVICE
 from typing import List, Tuple, Optional
 
 # MobileSAM imports
@@ -20,7 +21,7 @@ class SAMService:
                 "models", "mobile_sam.pt"
             )
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = DEVICE
         print(f"[SAM] Loading MobileSAM on {self.device}...")
 
         # MobileSAM 모델 로드

@@ -46,3 +46,40 @@ export interface OCRResponse {
   text?: string;
   error?: string;
 }
+
+export interface BatchItemResult {
+  filename: string;
+  success: boolean;
+  output_url?: string;
+  texts?: TextItem[];
+  image_width?: number;
+  image_height?: number;
+  error?: string;
+}
+
+export interface BatchResponse {
+  success: boolean;
+  batch_id: string;
+  count: number;
+  results: BatchItemResult[];
+  zip_url?: string | null;
+}
+
+export interface JobResultItem {
+  filename: string;
+  success: boolean;
+  output_url?: string;
+  n_texts?: number;
+  error?: string;
+}
+
+export interface JobStatus {
+  job_id: string;
+  status: 'queued' | 'processing' | 'done' | 'error';
+  phase?: string;
+  total: number;
+  done: number;
+  zip_url?: string | null;
+  error?: string | null;
+  results?: JobResultItem[];
+}

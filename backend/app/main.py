@@ -49,12 +49,7 @@ app = FastAPI(
 # CORS 설정 (Frontend에서 접근 허용)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",       # Next.js 개발 서버
-        "http://127.0.0.1:3000",
-        "http://58.227.107.5:10112",   # 외부 접속
-        settings.FRONTEND_URL,          # 프로덕션 URL
-    ],
+    allow_origins=[o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()] + [settings.FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
