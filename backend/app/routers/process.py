@@ -581,29 +581,60 @@ async def render_text_on_bubbles(
     return output_path
 
 
-def _mask_inner_rect(bubble_mask, x, y, w, h, inside_ratio=0.32):
-    """말풍선 SAM 마스크에서 글씨가 안전하게 들어갈 내접 영역 계산 (모양 적응).
-    거리변환으로 외곽에서 충분히 떨어진 안쪽만 사용 → 둥근/이형 말풍선도 안 넘침.
-    마스크가 없으면(효과음 등) None 반환 → 호출부에서 비례패딩 폴백."""
+def _largest_rect_in_hist(heights):
+    """히스토그램에서 최대 사각형 → (left, width, height)."""
+    stack = []; best = (0, 0, 0); n = len(heights)
+    for c in range(n + 1):
+        cur = heights[c] if c < n else 0
+        while stack and heights[stack[-1]] > cur:
+            top = stack.pop()
+            ht = heights[top]
+            left = stack[-1] + 1 if stack else 0
+            width = c - left
+            if ht * width > best[1] * best[2]:
+                best = (left, width, ht)
+        stack.append(c)
+    return best  # (left, width, height)
+
+
+def _mask_inner_rect(bubble_mask, x, y, w, h):
+    """말풍선 마스크 안에 '완전히 들어가는 최대 사각형'을 계산(모양 적응, 매직넘버 없음).
+    마스크 없으면(효과음 등) None → 호출부 폴백."""
     H, W = bubble_mask.shape[:2]
     x0, y0 = max(0, int(x)), max(0, int(y))
     x1, y1 = min(W, int(x + w)), min(H, int(y + h))
     if x1 <= x0 or y1 <= y0:
         return None
-    roi = bubble_mask[y0:y1, x0:x1]
+    roi = (bubble_mask[y0:y1, x0:x1] > 0).astype(np.uint8)
     if roi.size == 0 or int(roi.max()) == 0:
         return None
-    binroi = (roi > 0).astype(np.uint8)
-    dist = cv2.distanceTransform(binroi, cv2.DIST_L2, 5)
-    md = float(dist.max())
-    if md <= 1:
+    # 속도: ROI를 최대 변 160px로 축소 후 계산, 결과는 원배율로 환산
+    rh, rw = roi.shape
+    scale = min(1.0, 160.0 / max(rh, rw))
+    if scale < 1.0:
+        roi_s = cv2.resize(roi, (max(1, int(rw * scale)), max(1, int(rh * scale))), interpolation=cv2.INTER_NEAREST)
+    else:
+        roi_s = roi
+    sh, sw = roi_s.shape
+    heights = [0] * sw
+    best_area = 0; best = None  # (rx, ry, rw, rh) in roi_s
+    for r in range(sh):
+        rowv = roi_s[r]
+        for c in range(sw):
+            heights[c] = heights[c] + 1 if rowv[c] else 0
+        left, width, ht = _largest_rect_in_hist(heights)
+        if width * ht > best_area:
+            best_area = width * ht
+            best = (left, r - ht + 1, width, ht)
+    if not best or best_area == 0:
         return None
-    inside = (dist >= md * inside_ratio).astype(np.uint8)
-    ys, xs = np.where(inside)
-    if len(xs) == 0:
-        return None
-    ix0, iy0, ix1, iy1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
-    return (x0 + ix0, y0 + iy0, ix1 - ix0 + 1, iy1 - iy0 + 1)
+    rx, ry, rw2, rh2 = best
+    # 외곽선과 글씨 사이 여백 (중심 기준 축소) — 글자가 풍선 선에 안 닿게
+    margin = 0.84
+    nrw, nrh = rw2 * margin, rh2 * margin
+    rx += (rw2 - nrw) / 2.0; ry += (rh2 - nrh) / 2.0
+    inv = 1.0 / scale
+    return (x0 + int(rx * inv), y0 + int(ry * inv), int(nrw * inv), int(nrh * inv))
 
 
 async def render_with_inpainting(
